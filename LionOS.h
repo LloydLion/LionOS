@@ -5,10 +5,12 @@
 #define ProcessSignature()
 #define Process_DisallowManualInvoke() if(!OS::getUnderRunningProcess().isNull) Throw("Manual invoke is disallowed for this process")
 
-#define Delay(time) OS::setDelayTimeout(time); return
+#define Delay(time, rpl, rp) OS::returnAfterTo(rp, time); return; rpl:
+
+#define NavTable(rp) switch(rp)
+#define NavRecord(rp, rpl) case rp: goto rpl
 
 #include <ArduinoList.h>
-#include <setjmp.h>
 
 /*
 Task Dispacher for arduino
@@ -24,8 +26,9 @@ enum LogLevel
   Debug
 };
 
+typedef unsigned int ReturnPoint;
 typedef void (*TaskFunction)(void*);
-typedef void (*ProcessTask)();
+typedef void (*ProcessTask)(ReturnPoint);
 typedef void (*LoggerFunction)(LogLevel,char*,char*,char*);
 
 struct Task
@@ -34,14 +37,6 @@ public:
   TaskFunction task;
   unsigned long executionTime;
   void* paramter;
-};
-
-struct LongJmpBuffer
-{
-public:
-  bool init;
-  jmp_buf buf;
-  int val;
 };
 
 struct ProcessInfo
@@ -60,8 +55,9 @@ public:
   int id;
   bool stopped;
   char* name;
-  LongJmpBuffer retPoint;
-  int delayTimeout;
+  unsigned long baseTime;
+  int intervalReplacement;
+  ReturnPoint retPoint;
   ProcessTask task;
 };
 
@@ -73,6 +69,7 @@ class Dispatcher
 public:
   Dispatcher();
   void queryTask(TaskFunction task, int timer, void* arg);
+  void queryTask(TaskFunction task, void* arg, unsigned long targetTime);
   int getLeftTime();
   void tick();
   List<Task> tasks;
@@ -97,15 +94,14 @@ public:
   static void resumeProcess(ProcessTask task);
   static void log(LogLevel level, char* function, char* text);
   static void setLogger(LoggerFunction logger);
-  static void invokeProcess(ProcessTask task);
+  static void invokeProcess(ProcessTask task, ReturnPoint rp = 0);
   static void setMyInterval(int newInterval);
   static ProcessInfo getRunningProcess();
   static ProcessInfo getUnderRunningProcess();
   static ProcessInfo getProcess(ProcessTask task);
-  static void setDelayTimeout(int delay);
+  static void returnAfterTo(ReturnPoint targetRp, int time);
 
 private:
-  static void setReturnPoint();
   static void processInstance(void* data);
   static void processInstanceTimerInvoker(void* data);
   static Process* createProcess(ProcessTask task, int interval, char* name);
@@ -131,12 +127,14 @@ Dispatcher::Dispatcher()
 
 void Dispatcher::queryTask(TaskFunction task, int timer, void* arg)
 {
-  unsigned long mil = millis();
-  unsigned long et = mil + timer;
+  queryTask(task, arg, millis() + (unsigned long)timer);
+}
 
+void Dispatcher::queryTask(TaskFunction task, void* arg, unsigned long targetTime)
+{
   auto taskObj = Task();
   taskObj.task = task;
-  taskObj.executionTime = et;
+  taskObj.executionTime = targetTime;
   taskObj.paramter = arg;
   tasks.add(taskObj);
   recalculateMinTask();
@@ -209,7 +207,13 @@ static void OS::initialize()
 
 }
 
-static void OS::invokeProcess(ProcessTask task)
+static void OS::returnAfterTo(ReturnPoint targetRp, int time)
+{
+  runningProcess->retPoint = targetRp;
+  runningProcess->intervalReplacement = time;
+}
+
+static void OS::invokeProcess(ProcessTask task, ReturnPoint rp = 0)
 {
   auto process = getProcessDirect(task);
 
@@ -217,7 +221,7 @@ static void OS::invokeProcess(ProcessTask task)
   underRunningProcess = runningProcess;
   runningProcess = process;
 
-  task();
+  task(rp);
 
   runningProcess = underRunningProcess;
   underRunningProcess = lastUnder;
@@ -226,19 +230,6 @@ static void OS::invokeProcess(ProcessTask task)
 static void OS::setMyInterval(int newInterval)
 {
   runningProcess->interval = newInterval;
-}
-
-static void OS::setReturnPoint()
-{
-  LongJmpBuffer& point = runningProcess->retPoint;
-  point.init = true;
-  point.val = setjmp(point.buf);
-}
-
-static void OS::setDelayTimeout(int delay)
-{
-  runningProcess->delayTimeout = delay;
-  setReturnPoint();
 }
 
 static ProcessInfo OS::getRunningProcess()
@@ -325,7 +316,7 @@ static void OS::log(LogLevel level, char* function, char* text)
 
     case LogLevel::Exception:
       Serial.println("!!!!!!! [Exception in program work] !!!!!!!");
-      Serial.println("\t\t\tif you see this in release build please contact with developer");
+      Serial.println("\t\tif you see this in release build please contact with developer");
       Serial.print("\tProcess: ");
       if(underRunningProcess != nullptr) 
       {
@@ -362,12 +353,14 @@ static void OS::queryTask(ProcessTask task, int timer)
 
 static void OS::addProcess(ProcessTask task, int interval, char* name)
 {
-  dispatcher->queryTask(processInstance, interval, createProcess(task, interval, name));
+  dispatcher->queryTask(processInstance, createProcess(task, interval, name), interval);
 }
 
 static void OS::addProcess(ProcessTask task, int interval, char* name, int timer)
 {
-  dispatcher->queryTask(processInstanceTimerInvoker, timer, createProcess(task, interval, name));
+  auto process = createProcess(task, interval, name);
+  process->baseTime = timer;
+  dispatcher->queryTask(processInstanceTimerInvoker, process, timer);
 }
 
 static Process* OS::createProcess(ProcessTask task, int interval, char* name)
@@ -378,8 +371,9 @@ static Process* OS::createProcess(ProcessTask task, int interval, char* name)
   process.task = task;
   process.stopped = false;
   process.name = name;
-  process.delayTimeout = -1;
-  process.retPoint.init = false;
+  process.baseTime = 0;
+  process.retPoint = 0;
+  process.intervalReplacement = -1;
 
   processes.add(process);
 
@@ -394,36 +388,18 @@ static void OS::tick()
 
 static void OS::processInstance(void* data)
 {
-  auto pinfo = (Process*)data;
-  runningProcess = pinfo;
+  auto process = (Process*)data;
+  runningProcess = process;
 
-  if(pinfo->stopped == false)
-  {
-    if(pinfo->delayTimeout == -1)
-    {
-      Serial.println("Direct invoke");
-      pinfo->task();
-    }
-    else
-    {
-      pinfo->delayTimeout = -1;
-      pinfo->retPoint.init = false;
-      Serial.println("Longjmp invoke");
-      longjmp(pinfo->retPoint.buf, pinfo->retPoint.val);
-    }
-  }
+  auto rp = process->retPoint;
+  process->retPoint = 0;
 
-  if(pinfo->delayTimeout == -1)
-  {
-    Serial.println("Direct query");
-    dispatcher->queryTask(processInstance, pinfo->interval, pinfo);
-  }
-  else
-  {
-    Serial.println("Longjmp query");
-    dispatcher->queryTask(processInstance, pinfo->delayTimeout, pinfo);
-  }
+  if(process->stopped == false) process->task(rp);
 
+  process->baseTime += process->intervalReplacement == -1 ? process->interval : process->intervalReplacement;
+  dispatcher->queryTask(processInstance, process, process->baseTime);
+
+  process->intervalReplacement = -1;
   runningProcess = nullptr;
 }
 
