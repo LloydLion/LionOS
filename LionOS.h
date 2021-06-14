@@ -6,11 +6,20 @@
 #define Process_DisallowManualInvoke() if(!OS::getUnderRunningProcess().isNull) Throw("Manual invoke is disallowed for this process")
 
 #define Delay(time, rpl, rp) OS::returnAfterTo(rp, time); return; rpl:
+#define DelayRet(time, rpl, rp, ret) OS::returnAfterTo(rp, time); return ret; rpl:
 
 #define NavTable(rp) switch(rp)
 #define NavRecord(rp, rpl) case rp: goto rpl
+#define NTE default: Throw("Invalid ReturnPoint index"); case 0: break
+
+#define Var(type, name, val) static type name; name = val
 
 #include <ArduinoList.h>
+
+#ifdef LionOS_IntegrationGyverPower
+  #include <GyverPower.h>
+  #include <powerConstants.h>
+#endif
 
 /*
 Task Dispacher for arduino
@@ -26,10 +35,11 @@ enum LogLevel
   Debug
 };
 
-typedef unsigned int ReturnPoint;
+typedef int ReturnPoint;
 typedef void (*TaskFunction)(void*);
 typedef void (*ProcessTask)(ReturnPoint);
 typedef void (*LoggerFunction)(LogLevel,char*,char*,char*);
+typedef ReturnPoint (*StartCondition)();
 
 struct Task
 {
@@ -43,6 +53,7 @@ struct ProcessInfo
 {
   bool isNull;
   ProcessTask task;
+  StartCondition condition;
   int interval;
   bool stopped;
   char* name;
@@ -59,6 +70,7 @@ public:
   int intervalReplacement;
   ReturnPoint retPoint;
   ProcessTask task;
+  StartCondition condition;
 };
 
 int timeTaskSelector(const Task& task);
@@ -87,6 +99,7 @@ public:
   static void queryTask(ProcessTask task, int timer);
   static void addProcess(ProcessTask task, int interval, char* name);
   static void addProcess(ProcessTask task, int interval, char* name, int timer);
+  static void addHandlerProcess(ProcessTask task, StartCondition condition, char* name, int checkInterval = 5);
   static void tick();
   static int getLeftTime();
   static void initialize();
@@ -104,6 +117,7 @@ public:
 private:
   static void processInstance(void* data);
   static void processInstanceTimerInvoker(void* data);
+  static void handlerProcessInstance(void* data);
   static Process* createProcess(ProcessTask task, int interval, char* name);
   static Process* getProcessDirect(ProcessTask task);
   static ProcessInfo getProcessInfo(Process* process);
@@ -199,18 +213,33 @@ static void OS::initialize()
 
 #ifndef LionOS_NoAutoSerial
   #ifndef LionOS_SerialSpeed
-    Serial.begin(19200);
+    Serial.begin(38400);
   #else
     Serial.begin(LionOS_SerialSpeed);
   #endif
 #endif
 
+#ifdef LionOS_IntegrationGyverPower
+  #ifdef LionOS_IGP_ManualWDCalibrate
+    power.calibrate(LionOS_IGP_ManualWDCalibrate);
+  #else
+    power.autoCalibrate();
+  #endif
+#endif
 }
 
 static void OS::returnAfterTo(ReturnPoint targetRp, int time)
 {
-  runningProcess->retPoint = targetRp;
-  runningProcess->intervalReplacement = time;
+  if(underRunningProcess == nullptr)
+  {
+    runningProcess->retPoint = targetRp;
+    runningProcess->intervalReplacement = time;
+  }
+  else
+  {
+    underRunningProcess->retPoint = targetRp;
+    underRunningProcess->intervalReplacement = time;
+  }
 }
 
 static void OS::invokeProcess(ProcessTask task, ReturnPoint rp = 0)
@@ -283,6 +312,7 @@ static ProcessInfo OS::getProcessInfo(Process* process)
     info.interval = process->interval;
     info.stopped = process->stopped;
     info.task = process->task;
+    info.condition = process->condition;
   }
 
   return info;
@@ -359,8 +389,15 @@ static void OS::addProcess(ProcessTask task, int interval, char* name)
 static void OS::addProcess(ProcessTask task, int interval, char* name, int timer)
 {
   auto process = createProcess(task, interval, name);
-  process->baseTime = timer;
+  process->baseTime += timer;
   dispatcher->queryTask(processInstanceTimerInvoker, process, timer);
+}
+
+static void OS::addHandlerProcess(ProcessTask task, StartCondition condition, char* name, int checkInterval = 5)
+{
+  auto process = createProcess(task, checkInterval, name);
+  process->condition = condition;
+  dispatcher->queryTask(handlerProcessInstance, process, checkInterval);
 }
 
 static Process* OS::createProcess(ProcessTask task, int interval, char* name)
@@ -371,9 +408,10 @@ static Process* OS::createProcess(ProcessTask task, int interval, char* name)
   process.task = task;
   process.stopped = false;
   process.name = name;
-  process.baseTime = 0;
+  process.baseTime = interval;
   process.retPoint = 0;
   process.intervalReplacement = -1;
+  process.condition = nullptr;
 
   processes.add(process);
 
@@ -397,10 +435,35 @@ static void OS::processInstance(void* data)
   if(process->stopped == false) process->task(rp);
 
   process->baseTime += process->intervalReplacement == -1 ? process->interval : process->intervalReplacement;
-  dispatcher->queryTask(processInstance, process, process->baseTime);
 
   process->intervalReplacement = -1;
   runningProcess = nullptr;
+
+  if(process->condition == nullptr) dispatcher->queryTask(processInstance, process, process->baseTime);
+}
+
+static void OS::handlerProcessInstance(void* data)
+{
+  auto process = (Process*)data;
+  auto rp = process->condition();
+  bool lastStopped = process->stopped;
+
+  if(rp != -1)
+  {
+    process->retPoint = rp;
+  }
+  else
+  {
+    process->stoppped = true;
+  }
+
+  processInstance(data);
+
+  if()
+
+
+
+  dispatcher->queryTask(handlerProcessInstance, process, process->baseTime);
 }
 
 static void OS::processInstanceTimerInvoker(void* data)
@@ -431,8 +494,20 @@ void setup()
 void loop()
 {
   auto last = OS::getLeftTime();
+
+
+#ifndef LionOS_IntegrationGyverPower
   if(last > 0) delay(last);
+#else
+  int serial = Serial.availableForWrite() / 5;
+  delay(serial); //Serial send
+  if(last > 16 + serial) delay(power.sleepDelay(last - serial));
+#endif
+
   OS::tick();
 }
 
 #endif
+
+
+

@@ -4,28 +4,36 @@ void initialize()
 {
   Serial.println("start");
 
-  OS::addProcess(process1, 3000, "process1");
+  OS::addHandlerProcess(handler, checker, "process2", 3000);
+  //OS::addProcess(handler, 3000, "process2");
 }
 
 void process1(ReturnPoint rp)
 {
-  /*****/ ProcessSignature();
+  // /*****/ ProcessSignature();
+  // /*****/ Process_DisallowManualInvoke();
+  // /*****/ NavTable(rp) { NavRecord(1, rp1); NTE; }
 
-  NavTable(rp)
-  {
-    NavRecord(1, rp1);
-  }
+  // Var(int, i, 1);
 
-  Serial.println("+");
+  // Serial.print(i);
 
-  Delay(1000, rp1, 1);
-
-  Serial.println("===");
+  // Delay(1000, rp1, 1);
+  
+  // Serial.print("-");
+  // Serial.println(++i);
 }
 
-void process2()
+void handler(ReturnPoint rp)
 {
   /*****/ ProcessSignature();
 
+  Serial.println("asd");
+}
 
+ReturnPoint checker()
+{
+  bool av = Serial.available();
+  if(av) Serial.readString();
+  return av ? 0 : -1;
 }
